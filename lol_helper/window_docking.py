@@ -1,0 +1,43 @@
+from __future__ import annotations
+
+import ctypes
+from ctypes import wintypes
+
+
+user32 = ctypes.windll.user32
+
+
+def league_client_rect() -> tuple[int, int, int, int] | None:
+    matches: list[tuple[int, int, int, int]] = []
+    callback_type = ctypes.WINFUNCTYPE(ctypes.c_bool, wintypes.HWND, wintypes.LPARAM)
+
+    def callback(hwnd: int, _lparam: int) -> bool:
+        if not user32.IsWindowVisible(hwnd):
+            return True
+        length = user32.GetWindowTextLengthW(hwnd)
+        if length <= 0:
+            return True
+        buffer = ctypes.create_unicode_buffer(length + 1)
+        user32.GetWindowTextW(hwnd, buffer, length + 1)
+        title = buffer.value.lower()
+        if "league of legends" not in title and "英雄联盟" not in title:
+            return True
+        rect = wintypes.RECT()
+        if user32.GetWindowRect(hwnd, ctypes.byref(rect)):
+            width, height = rect.right - rect.left, rect.bottom - rect.top
+            if width >= 600 and height >= 400:
+                matches.append((rect.left, rect.top, rect.right, rect.bottom))
+        return True
+
+    user32.EnumWindows(callback_type(callback), 0)
+    return max(matches, key=lambda value: (value[2] - value[0]) * (value[3] - value[1])) if matches else None
+
+
+def sidebar_geometry(rect: tuple[int, int, int, int], width: int = 330) -> str:
+    left, top, right, bottom = rect
+    screen_width = user32.GetSystemMetrics(0)
+    screen_height = user32.GetSystemMetrics(1)
+    height = max(520, min(bottom - top, screen_height - max(top, 0)))
+    x = right + 6 if right + width + 6 <= screen_width else max(0, left - width - 6)
+    y = max(0, min(top, screen_height - height))
+    return f"{width}x{height}+{x}+{y}"
