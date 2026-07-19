@@ -5,6 +5,68 @@ from ctypes import wintypes
 
 
 user32 = ctypes.windll.user32
+user32.GetAncestor.argtypes = (wintypes.HWND, wintypes.UINT)
+user32.GetAncestor.restype = wintypes.HWND
+user32.GetParent.argtypes = (wintypes.HWND,)
+user32.GetParent.restype = wintypes.HWND
+
+GWL_EXSTYLE = -20
+WS_EX_TOOLWINDOW = 0x00000080
+WS_EX_APPWINDOW = 0x00040000
+SWP_NOSIZE = 0x0001
+SWP_NOMOVE = 0x0002
+SWP_NOZORDER = 0x0004
+SWP_NOACTIVATE = 0x0010
+SWP_FRAMECHANGED = 0x0020
+GA_ROOT = 2
+SPI_GETCLIENTAREAANIMATION = 0x1042
+DWMWA_TRANSITIONS_FORCEDISABLED = 3
+
+
+def native_window_handle(tk_window_id: int) -> int:
+    """Return Tk's outermost native window instead of its child drawing window."""
+    return user32.GetAncestor(tk_window_id, GA_ROOT) or user32.GetParent(tk_window_id) or tk_window_id
+
+
+def show_in_taskbar(tk_window_id: int) -> None:
+    """Expose a borderless Tk window as a normal Windows taskbar app."""
+    hwnd = native_window_handle(tk_window_id)
+    style = user32.GetWindowLongW(hwnd, GWL_EXSTYLE)
+    style = (style & ~WS_EX_TOOLWINDOW) | WS_EX_APPWINDOW
+    user32.SetWindowLongW(hwnd, GWL_EXSTYLE, style)
+    user32.SetWindowPos(
+        hwnd,
+        0,
+        0,
+        0,
+        0,
+        SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED,
+    )
+
+
+def enable_native_window_transitions(tk_window_id: int) -> None:
+    """Keep DWM minimize/restore transitions enabled for the custom-framed window."""
+    try:
+        disabled = wintypes.BOOL(False)
+        ctypes.windll.dwmapi.DwmSetWindowAttribute(
+            native_window_handle(tk_window_id),
+            DWMWA_TRANSITIONS_FORCEDISABLED,
+            ctypes.byref(disabled),
+            ctypes.sizeof(disabled),
+        )
+    except (AttributeError, OSError):
+        # DWM is unavailable on older/minimal Windows environments.
+        pass
+
+
+def system_window_animations_enabled() -> bool:
+    """Respect the user's Windows 'show animations' accessibility preference."""
+    enabled = wintypes.BOOL()
+    if not user32.SystemParametersInfoW(
+        SPI_GETCLIENTAREAANIMATION, 0, ctypes.byref(enabled), 0
+    ):
+        return True
+    return bool(enabled.value)
 
 
 def league_client_rect() -> tuple[int, int, int, int] | None:

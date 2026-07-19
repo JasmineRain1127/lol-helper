@@ -9,9 +9,15 @@ from typing import Any
 from .automation import AutomationEngine
 from .config import Settings
 from .ddragon import ChampionSummary, DataDragon
-from .lcu import restart_as_admin
+from .lcu import is_elevated, restart_as_admin
 from .logging_setup import configure_logging
-from .window_docking import league_client_rect, sidebar_geometry
+from .window_docking import (
+    enable_native_window_transitions,
+    league_client_rect,
+    show_in_taskbar,
+    sidebar_geometry,
+    system_window_animations_enabled,
+)
 
 
 BG = "#07121d"
@@ -22,6 +28,21 @@ MUTED = "#8296a5"
 GOLD = "#c99b3d"
 BLUE = "#2f8fc0"
 GREEN = "#39b77a"
+RED = "#d15b63"
+
+PHASE_LABELS = {
+    "None": "客户端待命",
+    "Lobby": "房间准备中",
+    "Matchmaking": "正在寻找对局",
+    "ReadyCheck": "等待确认对局",
+    "ChampSelect": "正在选择英雄",
+    "GameStart": "正在进入游戏",
+    "InProgress": "游戏进行中",
+    "Reconnect": "正在重新连接",
+    "WaitingForStats": "正在等待结算",
+    "PreEndOfGame": "本局已结束",
+    "EndOfGame": "查看对局结算",
+}
 
 
 class ModernScrollbar(tk.Canvas):
@@ -107,14 +128,16 @@ class HoverCard:
         self.title: tk.Label | None = None
         self.body: tk.Label | None = None
         self.champion_id: int | None = None
+        self.anchor_y = 0
 
     def show(self, widget: tk.Widget, summary: ChampionSummary) -> None:
         self.hide()
         self.champion_id = summary.champion_id
+        self.anchor_y = widget.winfo_rooty()
         window = tk.Toplevel(self.root)
         self.window = window
         window.overrideredirect(True)
-        window.transient(self.root)
+        window.attributes("-topmost", True)
         frame = tk.Frame(window, bg="#102536", highlightbackground=GOLD, highlightthickness=1, padx=12, pady=10)
         frame.pack(fill="both", expand=True)
         self.title = tk.Label(
@@ -127,15 +150,32 @@ class HoverCard:
                  font=("Microsoft YaHei UI", 9), anchor="w").pack(fill="x", pady=(2, 7))
         self.body = tk.Label(
             frame, text=summary.blurb or "正在读取技能信息……", bg="#102536", fg=TEXT,
-            font=("Microsoft YaHei UI", 9), justify="left", anchor="nw", wraplength=310,
+            font=("Microsoft YaHei UI", 9), justify="left", anchor="nw", wraplength=390,
         )
         self.body.pack(fill="both")
-        window.update_idletasks()
-        x = widget.winfo_rootx() - window.winfo_reqwidth() - 10
-        if x < 0:
-            x = widget.winfo_rootx() + widget.winfo_width() + 10
-        y = max(4, min(widget.winfo_rooty(), widget.winfo_screenheight() - window.winfo_reqheight() - 8))
-        window.geometry(f"+{x}+{y}")
+        self._resize_and_place()
+        window.lift()
+        window.after_idle(lambda: window.lift() if window.winfo_exists() else None)
+
+    def _resize_and_place(self) -> None:
+        """Fit the tooltip to its latest content and keep it on screen."""
+        if not self.window:
+            return
+        self.window.update_idletasks()
+        tooltip_width = self.window.winfo_reqwidth()
+        tooltip_height = self.window.winfo_reqheight()
+        root_left = self.root.winfo_rootx()
+        root_right = root_left + self.root.winfo_width()
+        screen_width = self.window.winfo_screenwidth()
+        screen_height = self.window.winfo_screenheight()
+        if root_left >= tooltip_width + 10:
+            x = root_left - tooltip_width - 10
+        else:
+            x = root_right + 10
+            if x + tooltip_width > screen_width:
+                x = max(4, screen_width - tooltip_width - 4)
+        y = max(4, min(self.anchor_y, screen_height - tooltip_height - 8))
+        self.window.geometry(f"{tooltip_width}x{tooltip_height}+{x}+{y}")
 
     def update(self, champion_id: int, detail: dict[str, Any]) -> None:
         if champion_id != self.champion_id or not self.body or not self.window:
@@ -147,9 +187,7 @@ class HoverCard:
         for spell in detail.get("spells", []):
             lines.append(f"{spell['key']} · {spell['name']}\n{spell['description']}")
         self.body.configure(text="\n\n".join(lines) or detail.get("blurb", "暂无技能资料"))
-        self.window.update_idletasks()
-        y = min(self.window.winfo_y(), self.window.winfo_screenheight() - self.window.winfo_reqheight() - 8)
-        self.window.geometry(f"+{self.window.winfo_x()}+{max(4, y)}")
+        self._resize_and_place()
 
     def hide(self) -> None:
         self.champion_id = None
@@ -165,13 +203,17 @@ class App:
         self.root.configure(bg=BG)
         self.root.geometry("330x720+20+60")
         self.root.minsize(310, 520)
+        self.root.attributes("-topmost", True)
         self.root.overrideredirect(True)
+        self._app_icon = self._create_app_icon()
+        self.root.iconphoto(True, self._app_icon)
         self.settings = Settings.load()
         self.settings.auto_accept = True
         self.settings.auto_pick = True
         self.settings.auto_bench_swap = True
         self.settings.preferred_champions = []
         self.settings.save()
+        self.is_admin = is_elevated()
 
         self.events: queue.Queue[tuple[str, Any]] = queue.Queue()
         self.executor = concurrent.futures.ThreadPoolExecutor(max_workers=4, thread_name_prefix="assets")
@@ -185,11 +227,21 @@ class App:
         self.session_state: dict[str, Any] | None = None
         self.last_render_signature: tuple[Any, ...] | None = None
         self.preload_started = False
+        self.position_manually_changed = False
+        self.initial_dock_completed = False
+        self.game_in_progress = False
+        self.hidden_for_game = False
         self.drag_origin: tuple[int, int, int, int] | None = None
+        self._minimize_requested = False
+        self._restore_animation_id: str | None = None
         self.hover = HoverCard(root)
         self.engine = AutomationEngine(self._settings_snapshot, self._on_event, configure_logging())
 
         self._build()
+        self.root.update_idletasks()
+        show_in_taskbar(self.root.winfo_id())
+        enable_native_window_transitions(self.root.winfo_id())
+        self.root.bind("<Map>", self._restore_window_style, add="+")
         self.root.protocol("WM_DELETE_WINDOW", self._close)
         self.root.after(80, self._drain_events)
         self.root.after(500, self._dock_to_client)
@@ -215,17 +267,33 @@ class App:
         tk.Button(header, text="×", command=self._close, bg="#091722", fg=MUTED,
                   activebackground="#7d2530", activeforeground="white", bd=0,
                   font=("Segoe UI", 14), cursor="hand2").pack(side="right", padx=(0, 8))
-        tk.Button(header, text="—", command=self.root.iconify, bg="#091722", fg=MUTED,
+        tk.Button(header, text="—", command=self._minimize, bg="#091722", fg=MUTED,
                   activebackground=PANEL, activeforeground="white", bd=0,
                   font=("Segoe UI", 11), cursor="hand2").pack(side="right")
 
-        target = tk.Frame(self.root, bg=PANEL, padx=14, pady=10)
+        target = tk.Frame(self.root, bg=PANEL, padx=14, pady=11,
+                          highlightbackground="#173247", highlightthickness=1)
         target.pack(fill="x", padx=10, pady=(10, 6))
-        tk.Label(target, text="当前目标", bg=PANEL, fg=MUTED,
+        tk.Label(target, text="本局目标", bg=PANEL, fg=MUTED,
                  font=("Microsoft YaHei UI", 8)).pack(anchor="w")
         self.target_label = tk.Label(target, text="等待进入选角", bg=PANEL, fg=TEXT,
                                      font=("Microsoft YaHei UI", 11, "bold"), anchor="w")
         self.target_label.pack(fill="x", pady=(2, 0))
+        self.target_hint = tk.Label(target, text="进入选角后点击英雄头像", bg=PANEL, fg=MUTED,
+                                    font=("Microsoft YaHei UI", 8), anchor="w")
+        self.target_hint.pack(fill="x", pady=(3, 0))
+
+        automation = tk.Frame(self.root, bg=BG)
+        automation.pack(fill="x", padx=12, pady=(3, 0))
+        for text in ("● 自动接受", "● 自动选择", "● 自动交换"):
+            tk.Label(automation, text=text, bg=BG, fg=GREEN,
+                     font=("Microsoft YaHei UI", 8)).pack(side="left", expand=True)
+
+        legend = tk.Frame(self.root, bg=BG)
+        legend.pack(fill="x", padx=14, pady=(6, 0))
+        for text, color in (("当前", GREEN), ("目标", GOLD), ("公共池", BLUE)):
+            tk.Label(legend, text=f"● {text}", bg=BG, fg=color,
+                     font=("Microsoft YaHei UI", 8)).pack(side="left", padx=(0, 12))
 
         self.canvas = tk.Canvas(self.root, bg=BG, highlightthickness=0, bd=0)
         scrollbar = ModernScrollbar(self.root, command=self.canvas.yview)
@@ -240,7 +308,7 @@ class App:
 
         footer = tk.Frame(self.root, bg="#091722", padx=12, pady=8)
         footer.pack(fill="x")
-        self.connection_dot = tk.Label(footer, text="●", bg="#091722", fg="#d15b63", font=("Segoe UI", 9))
+        self.connection_dot = tk.Label(footer, text="●", bg="#091722", fg=RED, font=("Segoe UI", 9))
         self.connection_dot.pack(side="left")
         self.connection_label = tk.Label(footer, text="等待客户端", bg="#091722", fg=MUTED,
                                          font=("Microsoft YaHei UI", 8))
@@ -251,6 +319,103 @@ class App:
         tk.Button(footer, text="诊断", command=self._diagnostic, bg="#091722", fg=MUTED,
                   activebackground=PANEL, activeforeground="white", bd=0, cursor="hand2").pack(side="right")
         self._show_empty("启动后会自动接受对局\n进入选角即可点击英雄头像")
+
+    def _create_app_icon(self) -> tk.PhotoImage:
+        icon = tk.PhotoImage(width=32, height=32)
+        icon.put(GOLD, to=(0, 0, 32, 32))
+        icon.put(BG, to=(8, 6, 13, 25))
+        icon.put(BG, to=(8, 20, 24, 25))
+        return icon
+
+    def _restore_window_style(self, _event: tk.Event | None = None) -> None:
+        if not self._minimize_requested:
+            self.root.after_idle(self._apply_borderless_window_style)
+            return
+
+        # A restored Tk window briefly has its native title bar. Make that
+        # intermediate frame transparent, then reveal the borderless window.
+        self._minimize_requested = False
+        self.root.attributes("-alpha", 0.0)
+        self.root.after_idle(self._finish_restore)
+
+    def _finish_restore(self) -> None:
+        self._apply_borderless_window_style()
+        self.root.update_idletasks()
+        self.root.lift()
+        if system_window_animations_enabled():
+            self._animate_restore_opacity()
+        else:
+            self.root.attributes("-alpha", 1.0)
+
+    def _animate_restore_opacity(self, step: int = 0) -> None:
+        """Quick ease-out reveal that masks the custom-frame handoff."""
+        steps = 10
+        progress = min(1.0, step / steps)
+        opacity = 1.0 - (1.0 - progress) ** 3
+        self.root.attributes("-alpha", opacity)
+        if step < steps:
+            self._restore_animation_id = self.root.after(
+                12, self._animate_restore_opacity, step + 1
+            )
+        else:
+            self._restore_animation_id = None
+
+    def _apply_borderless_window_style(self) -> None:
+        if self.root.state() != "normal":
+            return
+        self.root.overrideredirect(True)
+        self.root.attributes("-topmost", not self.game_in_progress)
+        show_in_taskbar(self.root.winfo_id())
+
+    def _minimize(self) -> None:
+        if self.root.state() != "normal" or self._minimize_requested:
+            return
+        self.hover.hide()
+        if self._restore_animation_id is not None:
+            self.root.after_cancel(self._restore_animation_id)
+            self._restore_animation_id = None
+            self.root.attributes("-alpha", 1.0)
+        self._minimize_requested = True
+        self.root.overrideredirect(False)
+        show_in_taskbar(self.root.winfo_id())
+        enable_native_window_transitions(self.root.winfo_id())
+        self.root.update_idletasks()
+        self.root.iconify()
+
+    def _apply_game_phase_window_policy(self, phase: str) -> None:
+        in_game = phase in {"GameStart", "InProgress", "Reconnect"}
+        if in_game == self.game_in_progress:
+            return
+        self.game_in_progress = in_game
+        if in_game:
+            self._clear_current_match()
+            self.root.attributes("-topmost", False)
+            self.root.withdraw()
+            self.hidden_for_game = True
+        elif self.hidden_for_game:
+            self.hidden_for_game = False
+            self.root.deiconify()
+            self.root.after_idle(self._apply_borderless_window_style)
+
+    def _clear_current_match(self) -> None:
+        """Discard the completed champ-select view so the next match starts fresh."""
+        self.hover.hide()
+        self.session_state = None
+        self.last_render_signature = None
+        self.asset_batch = ()
+        self.target_label.configure(
+            text="等待下一次进入选角" if self.game_in_progress else "等待进入选角",
+            fg=TEXT,
+        )
+        self.target_hint.configure(
+            text="下一局选角时会自动刷新" if self.game_in_progress else "进入选角后点击英雄头像"
+        )
+        message = (
+            "本局已开始\n等待下一次进入选角"
+            if self.game_in_progress
+            else "启动后会自动接受对局\n进入选角即可点击英雄头像"
+        )
+        self._show_empty(message)
 
     def _sync_canvas_layout(self, _event: tk.Event | None = None) -> None:
         """Pin short content to the top; only create a scroll range when needed."""
@@ -269,6 +434,7 @@ class App:
         return Settings(True, True, True, [], self.settings.poll_interval_ms)
 
     def _start_drag(self, event: tk.Event) -> None:
+        self.position_manually_changed = True
         self.drag_origin = (event.x_root, event.y_root, self.root.winfo_x(), self.root.winfo_y())
 
     def _drag(self, event: tk.Event) -> None:
@@ -277,9 +443,13 @@ class App:
             self.root.geometry(f"+{wx + event.x_root - sx}+{wy + event.y_root - sy}")
 
     def _dock_to_client(self) -> None:
+        if self.position_manually_changed or self.initial_dock_completed:
+            return
         rect = league_client_rect()
         if rect:
             self.root.geometry(sidebar_geometry(rect))
+            self.initial_dock_completed = True
+            return
         self.root.after(2000, self._dock_to_client)
 
     def _load_ddragon(self) -> dict[int, ChampionSummary]:
@@ -342,8 +512,10 @@ class App:
             child.destroy()
         if target:
             self.target_label.configure(text=self._name(int(target)), fg="#f2d58a")
+            self.target_hint.configure(text="再次点击该英雄可取消目标")
         else:
             self.target_label.configure(text="点击一个英雄头像", fg=TEXT)
+            self.target_hint.configure(text="助手会自动选择或从公共池交换")
 
         own = list(dict.fromkeys(([int(current)] if current else []) + cards))
         self._section("我的英雄", own, current, target, "own")
@@ -389,8 +561,13 @@ class App:
         return summary.name if summary else self.fallback_names.get(champion_id, str(champion_id))
 
     def _choose(self, champion_id: int) -> None:
-        self.engine.set_target_champion(champion_id)
-        self.target_label.configure(text=self._name(champion_id), fg="#f2d58a")
+        current_target = self.session_state.get("target") if self.session_state else None
+        target = None if current_target == champion_id else champion_id
+        self.engine.set_target_champion(target)
+        if self.session_state is not None:
+            self.session_state["target"] = target
+            self.last_render_signature = None
+            self._render_session()
 
     def _hover_enter(self, widget: tk.Widget, champion_id: int) -> None:
         summary = self.summaries.get(champion_id)
@@ -470,21 +647,22 @@ class App:
                     ))
                     self._request_portraits(ids)
                 elif level == "target_cleared":
-                    self.session_state = None
-                    self.last_render_signature = None
-                    self.target_label.configure(text="等待进入选角", fg=TEXT)
-                    self._show_empty("启动后会自动接受对局\n进入选角即可点击英雄头像")
+                    self._clear_current_match()
                 elif level in {"status", "offline", "permission"}:
                     text = str(payload)
                     phase = text.replace("客户端在线 · ", "")
-                    self.phase_label.configure(text=phase)
-                    self.connection_label.configure(text="已连接" if level == "status" else "需要管理员权限" if level == "permission" else "等待客户端")
+                    self.phase_label.configure(text=PHASE_LABELS.get(phase, phase))
+                    self.connection_label.configure(
+                        text=("已连接 · 管理员" if self.is_admin else "已连接")
+                        if level == "status"
+                        else "需要管理员权限" if level == "permission"
+                        else "等待客户端"
+                    )
                     self.connection_dot.configure(fg=GREEN if level == "status" else GOLD if level == "permission" else "#d15b63")
-                    if level == "status" and phase == "InProgress":
-                        self.hover.hide()
-                        self.root.withdraw()
-                    elif level == "status" and self.root.state() == "withdrawn":
-                        self.root.deiconify()
+                    if level == "status":
+                        self._apply_game_phase_window_policy(phase)
+                        if self.admin_button.winfo_ismapped():
+                            self.admin_button.pack_forget()
                     if level == "permission" and not self.admin_button.winfo_ismapped():
                         self.admin_button.pack(side="right", padx=7)
                 elif level == "asset_error":
