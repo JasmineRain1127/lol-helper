@@ -1,8 +1,10 @@
+import logging
 import unittest
 from pathlib import Path
 from uuid import uuid4
 
 from lol_helper.automation import (
+    AutomationEngine,
     bench_ids,
     card_ids,
     current_champion_id,
@@ -95,6 +97,39 @@ class SettingsTests(unittest.TestCase):
 class DataDragonTests(unittest.TestCase):
     def test_strips_html_from_skill_text(self):
         self.assertEqual(_plain_text("造成 <b>魔法伤害</b><br />并减速。"), "造成 魔法伤害\n并减速。")
+
+
+class AutomationEngineTests(unittest.TestCase):
+    def test_accepts_once_per_ready_check(self):
+        class Client:
+            phase = "ReadyCheck"
+            posts: list[str] = []
+
+            def get(self, path):
+                if path == "/lol-gameflow/v1/gameflow-phase":
+                    return self.phase
+                if path == "/lol-matchmaking/v1/ready-check":
+                    return {"state": "InProgress", "timer": 8}
+                raise AssertionError(path)
+
+            def post(self, path, _data=None):
+                self.posts.append(path)
+
+        events = []
+        client = Client()
+        engine = AutomationEngine(Settings, lambda level, payload: events.append((level, payload)), logging.getLogger())
+        engine._client = client
+
+        engine._tick()
+        engine._tick()
+        self.assertEqual(len(client.posts), 1)
+        self.assertEqual(sum(level == "status" for level, _payload in events), 1)
+
+        client.phase = "Lobby"
+        engine._tick()
+        client.phase = "ReadyCheck"
+        engine._tick()
+        self.assertEqual(len(client.posts), 2)
 
 
 if __name__ == "__main__":

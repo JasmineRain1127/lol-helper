@@ -113,6 +113,7 @@ class AutomationEngine:
         self._swap_attempt: dict[int, float] = {}
         self._last_session: dict[str, Any] | None = None
         self._catalog_loaded = False
+        self._last_phase: str | None = None
         self._connection_message = "等待英雄联盟客户端启动"
         self._target_lock = threading.Lock()
         self._target_champion_id: int | None = None
@@ -162,6 +163,8 @@ class AutomationEngine:
         try:
             self._client = LCUClient()
             self._client.get("/lol-gameflow/v1/gameflow-phase")
+            self._last_phase = None
+            self._accepted_id = None
             self._emit("info", "已连接英雄联盟客户端")
             self._load_champion_catalog()
             return True
@@ -213,6 +216,8 @@ class AutomationEngine:
                 self._client = None
                 self._last_session = None
                 self._catalog_loaded = False
+                self._last_phase = None
+                self._accepted_id = None
                 self._event("offline", "客户端已断开，正在等待重连")
             except Exception as exc:  # keep the monitor alive and retain diagnostics
                 self._logger.exception("监控循环异常")
@@ -224,7 +229,11 @@ class AutomationEngine:
         assert self._client is not None
         settings = self._settings_provider()
         phase = self._client.get("/lol-gameflow/v1/gameflow-phase")
-        self._event("status", f"客户端在线 · {phase}")
+        if phase != self._last_phase:
+            self._event("status", f"客户端在线 · {phase}")
+            self._last_phase = phase
+        if phase != "ReadyCheck":
+            self._accepted_id = None
         if settings.auto_accept and phase == "ReadyCheck":
             self._accept()
         if phase == "ChampSelect":
@@ -240,12 +249,13 @@ class AutomationEngine:
 
     def _accept(self) -> None:
         assert self._client is not None
+        if self._accepted_id == "accepted":
+            return
         try:
             check = self._client.get("/lol-matchmaking/v1/ready-check") or {}
-            check_id = str(check.get("timer", check.get("state", "ready")))
-            if check.get("state") == "InProgress" and check_id != self._accepted_id:
+            if check.get("state") == "InProgress":
                 self._client.post("/lol-matchmaking/v1/ready-check/accept")
-                self._accepted_id = check_id
+                self._accepted_id = "accepted"
                 self._emit("info", "已自动接受对局")
         except LCUResponseError as exc:
             if exc.status not in {404, 409}:
