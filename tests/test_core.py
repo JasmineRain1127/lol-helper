@@ -5,6 +5,7 @@ from uuid import uuid4
 
 from lol_helper.automation import (
     AutomationEngine,
+    bench_champion_ids,
     bench_ids,
     card_ids,
     current_champion_id,
@@ -13,8 +14,9 @@ from lol_helper.automation import (
     redact_session,
 )
 from lol_helper.config import ROOT, Settings
-from lol_helper.ddragon import _plain_text
 from lol_helper.lcu import Credentials, _credentials_from_lockfile, _extract_credentials
+from lol_helper.ui import bench_slot_layout, should_show_bar
+from lol_helper.window_docking import top_bar_geometry
 
 
 class CredentialsTests(unittest.TestCase):
@@ -59,6 +61,20 @@ class SessionTests(unittest.TestCase):
         self.assertEqual(card_ids(session), {145, 157})
         self.assertEqual(pickable_ids(session), {81, 22, 145, 157})
 
+    def test_preserves_bench_order_and_deduplicates(self):
+        session = {
+            "benchChampions": [
+                {"championId": 81},
+                {"championId": "22"},
+                {"championId": 81},
+                {"championId": 0},
+                {"championId": "invalid"},
+                145,
+            ]
+        }
+        self.assertEqual(bench_champion_ids(session), [81, 22, 145])
+        self.assertEqual(bench_ids(session), {81, 22, 145})
+
     def test_extracts_current_champion(self):
         session = {
             "localPlayerCellId": 3,
@@ -94,11 +110,6 @@ class SettingsTests(unittest.TestCase):
                 parent.rmdir()
 
 
-class DataDragonTests(unittest.TestCase):
-    def test_strips_html_from_skill_text(self):
-        self.assertEqual(_plain_text("造成 <b>魔法伤害</b><br />并减速。"), "造成 魔法伤害\n并减速。")
-
-
 class AutomationEngineTests(unittest.TestCase):
     def test_accepts_once_per_ready_check(self):
         class Client:
@@ -130,6 +141,84 @@ class AutomationEngineTests(unittest.TestCase):
         client.phase = "ReadyCheck"
         engine._tick()
         self.assertEqual(len(client.posts), 2)
+
+    def test_champ_select_keeps_bench_order_and_swaps_target(self):
+        class Client:
+            posts: list[str] = []
+
+            def get(self, path):
+                self.assert_session_path(path)
+                return {
+                    "benchChampions": [
+                        {"championId": 145},
+                        {"championId": 22},
+                        {"championId": 81},
+                    ],
+                    "localPlayerCellId": 1,
+                    "myTeam": [{"cellId": 1, "championId": 99}],
+                }
+
+            def post(self, path, _data=None):
+                self.posts.append(path)
+
+            @staticmethod
+            def assert_session_path(path):
+                if path != "/lol-champ-select/v1/session":
+                    raise AssertionError(path)
+
+        events = []
+        client = Client()
+        engine = AutomationEngine(
+            lambda: Settings(),
+            lambda level, payload: events.append((level, payload)),
+            logging.getLogger(),
+        )
+        engine._client = client
+        engine.set_target_champion(22)
+        engine._champ_select(Settings())
+
+        payload = next(payload for level, payload in events if level == "champ_select")
+        self.assertEqual(payload["bench"], [145, 22, 81])
+        self.assertEqual(
+            client.posts,
+            ["/lol-champ-select/v1/session/bench/swap/22"],
+        )
+
+
+class WindowDockingTests(unittest.TestCase):
+    def test_top_bar_sits_above_client_top_edge(self):
+        self.assertEqual(top_bar_geometry((100, 150, 1380, 870)), "1280x72+100+78")
+
+    def test_top_bar_supports_negative_monitor_coordinates(self):
+        self.assertEqual(top_bar_geometry((-1920, 100, 0, 1180)), "1920x72-1920+28")
+
+    def test_top_bar_uses_requested_height_independent_of_client_height(self):
+        self.assertEqual(top_bar_geometry((0, 100, 800, 140)), "800x72+0+28")
+
+
+class TopBarUiTests(unittest.TestCase):
+    def test_bench_slots_match_1280_client_design_coordinates(self):
+        self.assertEqual(
+            bench_slot_layout(1280, 3),
+            [(352, 50), (410, 50), (469, 50)],
+        )
+
+    def test_bench_slots_scale_to_users_125_percent_client(self):
+        self.assertEqual(
+            bench_slot_layout(1600, 3),
+            [(440, 62), (513, 62), (586, 62)],
+        )
+
+    def test_slot_size_is_capped_without_losing_center_alignment(self):
+        self.assertEqual(bench_slot_layout(1920, 1), [(535, 62)])
+
+    def test_bar_requires_champ_select_bench_client_and_portraits(self):
+        rect = (100, 50, 1380, 770)
+        self.assertTrue(should_show_bar("ChampSelect", [81, 22], rect, {81, 22}))
+        self.assertFalse(should_show_bar("Lobby", [81, 22], rect, {81, 22}))
+        self.assertFalse(should_show_bar("ChampSelect", [], rect, set()))
+        self.assertFalse(should_show_bar("ChampSelect", [81], None, {81}))
+        self.assertFalse(should_show_bar("ChampSelect", [81, 22], rect, {81}))
 
 
 if __name__ == "__main__":

@@ -1,13 +1,11 @@
 from __future__ import annotations
 
 import json
-import re
 import threading
 import time
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
-from html import unescape
 from pathlib import Path
 from typing import Any
 
@@ -18,20 +16,10 @@ BASE_URL = "https://ddragon.leagueoflegends.com"
 CACHE_DIR = ROOT / "cache" / "ddragon"
 
 
-def _plain_text(value: str) -> str:
-    value = re.sub(r"<br\s*/?>", "\n", value, flags=re.IGNORECASE)
-    value = re.sub(r"<[^>]+>", "", value)
-    return unescape(value).strip()
-
-
 @dataclass(frozen=True, slots=True)
 class ChampionSummary:
     champion_id: int
-    alias: str
     name: str
-    title: str
-    tags: tuple[str, ...]
-    blurb: str
     image_file: str
 
 
@@ -81,11 +69,7 @@ class DataDragon:
                 champion_id = int(raw["key"])
                 result[champion_id] = ChampionSummary(
                     champion_id=champion_id,
-                    alias=str(raw["id"]),
                     name=str(raw["name"]),
-                    title=str(raw.get("title", "")),
-                    tags=tuple(str(tag) for tag in raw.get("tags", [])),
-                    blurb=_plain_text(str(raw.get("blurb", ""))),
                     image_file=str(raw["image"]["full"]),
                 )
             except (KeyError, TypeError, ValueError):
@@ -113,33 +97,3 @@ class DataDragon:
                 except Exception:
                     pass
         return completed, len(champion_ids)
-
-    def details(self, champion_id: int) -> dict[str, Any]:
-        champion = self.by_id[champion_id]
-        path = CACHE_DIR / self.version / self.locale / "champion" / f"{champion.alias}.json"
-        raw = self._json(
-            f"{BASE_URL}/cdn/{self.version}/data/{self.locale}/champion/{champion.alias}.json",
-            path,
-        )
-        detail = raw.get("data", {}).get(champion.alias, {})
-        passive = detail.get("passive", {})
-        spells = detail.get("spells", [])
-        return {
-            "id": champion_id,
-            "name": champion.name,
-            "title": champion.title,
-            "tags": champion.tags,
-            "blurb": champion.blurb,
-            "passive": {
-                "name": str(passive.get("name", "")),
-                "description": _plain_text(str(passive.get("description", ""))),
-            },
-            "spells": [
-                {
-                    "key": key,
-                    "name": str(spell.get("name", "")),
-                    "description": _plain_text(str(spell.get("description", ""))),
-                }
-                for key, spell in zip(("Q", "W", "E", "R"), spells)
-            ],
-        }
