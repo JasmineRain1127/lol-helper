@@ -74,7 +74,7 @@ def league_client_rect() -> tuple[int, int, int, int] | None:
     callback_type = ctypes.WINFUNCTYPE(ctypes.c_bool, wintypes.HWND, wintypes.LPARAM)
 
     def callback(hwnd: int, _lparam: int) -> bool:
-        if not user32.IsWindowVisible(hwnd):
+        if not user32.IsWindowVisible(hwnd) or user32.IsIconic(hwnd):
             return True
         length = user32.GetWindowTextLengthW(hwnd)
         if length <= 0:
@@ -95,11 +95,9 @@ def league_client_rect() -> tuple[int, int, int, int] | None:
     return max(matches, key=lambda value: (value[2] - value[0]) * (value[3] - value[1])) if matches else None
 
 
-def sidebar_geometry(rect: tuple[int, int, int, int], width: int = 330) -> str:
-    left, top, right, bottom = rect
-    screen_width = user32.GetSystemMetrics(0)
-    screen_height = user32.GetSystemMetrics(1)
-    height = max(520, min(bottom - top, screen_height - max(top, 0)))
-    x = right + 6 if right + width + 6 <= screen_width else max(0, left - width - 6)
-    y = max(0, min(top, screen_height - height))
-    return f"{width}x{height}+{x}+{y}"
+def top_bar_geometry(rect: tuple[int, int, int, int], height: int = 72) -> str:
+    """Attach a horizontal bar immediately above the League client."""
+    left, top, right, _bottom = rect
+    width = max(1, right - left)
+    bar_height = max(1, height)
+    return f"{width}x{bar_height}{left:+d}{top - bar_height:+d}"

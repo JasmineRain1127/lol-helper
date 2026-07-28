@@ -43,16 +43,24 @@ def current_pick_action(session: dict[str, Any]) -> dict[str, Any] | None:
     return None
 
 
-def bench_ids(session: dict[str, Any]) -> set[int]:
-    result: set[int] = set()
+def bench_champion_ids(session: dict[str, Any]) -> list[int]:
+    """Return the ARAM bench in the same order used by the League client."""
+    result: list[int] = []
+    seen: set[int] = set()
     for item in session.get("benchChampions", []) or []:
         if isinstance(item, dict):
             champion_id = _int(item.get("championId"))
         else:
             champion_id = _int(item)
-        if champion_id:
-            result.add(champion_id)
+        if champion_id and champion_id not in seen:
+            seen.add(champion_id)
+            result.append(champion_id)
     return result
+
+
+def bench_ids(session: dict[str, Any]) -> set[int]:
+    """Compatibility helper for callers that only need bench membership."""
+    return set(bench_champion_ids(session))
 
 
 def card_ids(session: dict[str, Any]) -> set[int]:
@@ -230,7 +238,7 @@ class AutomationEngine:
         settings = self._settings_provider()
         phase = self._client.get("/lol-gameflow/v1/gameflow-phase")
         if phase != self._last_phase:
-            self._event("status", f"客户端在线 · {phase}")
+            self._event("status", phase)
             self._last_phase = phase
         if phase != "ReadyCheck":
             self._accepted_id = None
@@ -268,12 +276,12 @@ class AutomationEngine:
             return
         self._last_session = session
         cards = card_ids(session)
-        bench = bench_ids(session)
+        ordered_bench = bench_champion_ids(session)
+        bench = set(ordered_bench)
         current = current_champion_id(session)
         target = self._target()
         self._event("champ_select", {
-            "cards": sorted(cards),
-            "bench": sorted(bench),
+            "bench": ordered_bench,
             "current": current,
             "target": target,
         })
