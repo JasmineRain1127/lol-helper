@@ -84,16 +84,18 @@ class DataDragon:
             self._download(f"{BASE_URL}/cdn/{self.version}/img/champion/{champion.image_file}", path)
         return path
 
-    def preload_portraits(self, workers: int = 10) -> tuple[int, int]:
-        """Warm the complete square-portrait cache without blocking the UI thread."""
+    def preload_portraits(self, workers: int = 10) -> dict[int, str]:
+        """Warm every portrait and return paths ready for immediate UI use."""
         champion_ids = list(self.by_id)
-        completed = 0
+        completed: dict[int, str] = {}
         with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="ddragon-preload") as pool:
-            futures = [pool.submit(self.portrait, champion_id) for champion_id in champion_ids]
+            futures = {
+                pool.submit(self.portrait, champion_id): champion_id
+                for champion_id in champion_ids
+            }
             for future in as_completed(futures):
                 try:
-                    future.result()
-                    completed += 1
+                    completed[futures[future]] = str(future.result())
                 except Exception:
                     pass
-        return completed, len(champion_ids)
+        return completed
