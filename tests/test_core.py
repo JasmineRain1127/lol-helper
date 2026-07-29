@@ -14,6 +14,7 @@ from lol_helper.automation import (
     redact_session,
 )
 from lol_helper.config import ROOT, Settings
+from lol_helper.ddragon import ChampionSummary, DataDragon
 from lol_helper.lcu import Credentials, _credentials_from_lockfile, _extract_credentials
 from lol_helper.ui import bench_slot_layout, should_show_bar
 from lol_helper.window_docking import top_bar_geometry
@@ -142,6 +143,28 @@ class AutomationEngineTests(unittest.TestCase):
         engine._tick()
         self.assertEqual(len(client.posts), 2)
 
+
+class DataDragonTests(unittest.TestCase):
+    def test_preloads_all_available_portrait_paths(self):
+        dragon = DataDragon()
+        dragon.by_id = {
+            22: ChampionSummary(22, "艾希", "Ashe.png"),
+            81: ChampionSummary(81, "伊泽瑞尔", "Ezreal.png"),
+        }
+
+        paths = {
+            22: Path("cache/Ashe.png"),
+            81: Path("cache/Ezreal.png"),
+        }
+        dragon.portrait = lambda champion_id: paths[champion_id]
+
+        self.assertEqual(
+            dragon.preload_portraits(workers=2),
+            {22: str(paths[22]), 81: str(paths[81])},
+        )
+
+
+class AutomationSwapTests(unittest.TestCase):
     def test_champ_select_keeps_bench_order_and_swaps_target(self):
         class Client:
             posts: list[str] = []

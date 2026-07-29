@@ -38,6 +38,8 @@ python main.py
 
 配置保存在 `config/settings.json`，日志位于 `logs`。英雄头像及中文名称来自 Riot Data Dragon，并缓存到 `cache/ddragon`。本局目标只在当前选角会话内有效，离开选角后自动清空。
 
+程序启动后会在后台预加载全部英雄头像。首次运行需要完成一次下载，之后直接使用本地缓存，避免交换英雄时因临时加载新头像导致横条消失。
+
 ## 打包
 
 使用项目内的 PyInstaller 配置生成带管理员权限清单和 Windows 版本信息的单文件程序：

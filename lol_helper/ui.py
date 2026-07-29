@@ -101,6 +101,7 @@ class App:
         self.portrait_paths: dict[int, str] = {}
         self.photos: dict[int, tk.PhotoImage] = {}
         self.asset_batch: tuple[int, ...] = ()
+        self.preload_started = False
         self.session_state: dict[str, Any] | None = None
         self.current_phase: str | None = None
         self.client_rect: tuple[int, int, int, int] | None = None
@@ -333,6 +334,16 @@ class App:
                 if level == "ddragon" and isinstance(payload, dict):
                     self.summaries = payload
                     self._request_portraits(self._bench())
+                    if not self.preload_started:
+                        self.preload_started = True
+                        self.executor.submit(
+                            self.ddragon.preload_portraits
+                        ).add_done_callback(self._future_to_event("preload_done"))
+                elif level == "preload_done" and isinstance(payload, dict):
+                    self.portrait_paths.update(payload)
+                    self.asset_batch = ()
+                    self.last_render_signature = None
+                    self._render_session()
                 elif level == "portraits" and isinstance(payload, dict):
                     self.portrait_paths.update(payload)
                     self.asset_batch = ()
