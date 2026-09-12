@@ -12,6 +12,7 @@ from .automation import AutomationEngine
 from .config import Settings
 from .ddragon import ChampionSummary, DataDragon
 from .logging_setup import configure_logging
+from .startup import StartupNotice
 from .window_docking import (
     enable_native_window_transitions,
     league_client_window,
@@ -125,6 +126,7 @@ class App:
         self.root.protocol("WM_DELETE_WINDOW", self._close)
         self.tray = TrayIcon(self.root, self._close)
         self.root.withdraw()
+        self.startup_notice = StartupNotice(self.root)
         self.root.after(80, self._drain_events)
         self.root.after(DOCK_INTERVAL_MS, self._dock_to_client)
         self.root.after(100, self._sync_focus)
@@ -390,6 +392,7 @@ class App:
         try:
             while True:
                 level, payload = self.events.get_nowait()
+                self.startup_notice.update_status(level, payload)
                 if level == "ddragon" and isinstance(payload, dict):
                     self.summaries = payload
                     self._request_portraits(self._bench())
@@ -470,6 +473,7 @@ class App:
         self.root.after(80, self._drain_events)
 
     def _close(self) -> None:
+        self.startup_notice.close()
         self.tray.close()
         self.engine.stop()
         self.executor.shutdown(wait=False, cancel_futures=True)
