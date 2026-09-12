@@ -22,6 +22,7 @@ from lol_helper.ddragon import ChampionSummary, DataDragon
 from lol_helper.lcu import LCUNotRunning, LCUResponseError, Credentials, _credentials_from_lockfile, _extract_credentials
 from lol_helper.ui import App, bench_slot_layout, should_show_bar
 from lol_helper.window_docking import top_bar_geometry, sync_bar_z_order, SWP_NOACTIVATE
+from lol_helper import window_docking
 
 
 class CredentialsTests(unittest.TestCase):
@@ -367,6 +368,30 @@ class TopBarUiTests(unittest.TestCase):
         self.assertFalse(should_show_bar("ChampSelect", [], rect, set()))
         self.assertFalse(should_show_bar("ChampSelect", [81], None, {81}))
         self.assertFalse(should_show_bar("ChampSelect", [81, 22], rect, {81}))
+
+
+class WindowDockingTests(unittest.TestCase):
+    def test_taskbar_style_update_passes_all_set_window_pos_arguments(self):
+        class User32:
+            def GetWindowLongW(self, _hwnd, _index):
+                return 0
+
+            def SetWindowLongW(self, _hwnd, _index, _style):
+                return 0
+
+            def SetWindowPos(self, *args):
+                self.args = args
+                return 1
+
+        fake = User32()
+        previous = window_docking.user32
+        try:
+            window_docking.user32 = fake
+            with patch("lol_helper.window_docking.native_window_handle", return_value=123):
+                window_docking.show_in_taskbar(456)
+        finally:
+            window_docking.user32 = previous
+        self.assertEqual(len(fake.args), 7)
 
 
 if __name__ == "__main__":
