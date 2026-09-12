@@ -5,16 +5,18 @@ import queue
 import tkinter as tk
 import time
 from collections.abc import Collection
+from dataclasses import replace
 from typing import Any
 
 from .automation import AutomationEngine
 from .config import Settings
 from .ddragon import ChampionSummary, DataDragon
 from .logging_setup import configure_logging
-from .tray import TrayIcon
 from .window_docking import (
     enable_native_window_transitions,
-    league_client_rect,
+    league_client_window,
+    sync_bar_z_order,
+    system_window_animations_enabled,
     show_in_taskbar,
     top_bar_geometry,
 )
@@ -77,21 +79,18 @@ def should_show_bar(
 
 class App:
     def __init__(self, root: tk.Tk):
+        from .tray import TrayIcon
+
         self.root = root
         self.root.title("LOL Helper")
         self.root.configure(bg=FRAME_BORDER)
         self.root.geometry(f"600x{BAR_HEIGHT}+0+0")
-        self.root.attributes("-topmost", True)
+        self.root.attributes("-topmost", False)
         self.root.overrideredirect(True)
         self._app_icon = self._create_app_icon()
         self.root.iconphoto(True, self._app_icon)
 
         self.settings = Settings.load()
-        self.settings.auto_accept = True
-        self.settings.auto_pick = True
-        self.settings.auto_bench_swap = True
-        self.settings.preferred_champions = []
-        self.settings.save()
         self.events: queue.Queue[tuple[str, Any]] = queue.Queue()
         self.executor = concurrent.futures.ThreadPoolExecutor(
             max_workers=4, thread_name_prefix="assets"
@@ -109,6 +108,10 @@ class App:
         self.bench_empty_since: float | None = None
         self.last_render_signature: tuple[Any, ...] | None = None
         self.bar_visible = False
+        self.client_hwnd: int | None = None
+        self.cards: dict[int, tk.Frame] = {}
+        self.animation_jobs: dict[int, str] = {}
+        self.animations_enabled = system_window_animations_enabled()
 
         self.engine = AutomationEngine(
             self._settings_snapshot, self._on_event, configure_logging()
@@ -124,6 +127,7 @@ class App:
         self.root.withdraw()
         self.root.after(80, self._drain_events)
         self.root.after(DOCK_INTERVAL_MS, self._dock_to_client)
+        self.root.after(100, self._sync_focus)
         self.engine.start()
         self.executor.submit(self.ddragon.load).add_done_callback(
             self._future_to_event("ddragon")
@@ -154,14 +158,16 @@ class App:
         if self.root.state() != "normal":
             return
         self.root.overrideredirect(True)
-        self.root.attributes("-topmost", True)
+        self.root.attributes("-topmost", False)
         show_in_taskbar(self.root.winfo_id())
 
     def _settings_snapshot(self) -> Settings:
-        return Settings(True, True, True, [], self.settings.poll_interval_ms)
+        return replace(self.settings, preferred_champions=list(self.settings.preferred_champions))
 
     def _dock_to_client(self) -> None:
-        detected_rect = league_client_rect()
+        window = league_client_window()
+        self.client_hwnd = window[0] if window else None
+        detected_rect = window[1] if window else None
         if detected_rect is not None:
             self.client_rect = detected_rect
             self.client_missing_since = None
@@ -247,9 +253,18 @@ class App:
             return
 
         self.last_render_signature = signature
+        for job in self.animation_jobs.values():
+            self.root.after_cancel(job)
+        self.animation_jobs.clear()
+        self.cards.clear()
         for child in self.row.winfo_children():
             child.destroy()
         self.photos.clear()
+
+        self.feedback = tk.Label(self.row, text=self._selection_text(target),
+                                 bg=BG, fg=GOLD, font=("Microsoft YaHei UI", 10),
+                                 anchor="w", wraplength=max(120, slot_layout[0][0] - 28))
+        self.feedback.place(x=14, y=0, width=max(120, slot_layout[0][0] - 28), height=BAR_HEIGHT)
 
         for champion_id, (slot_left, slot_size) in zip(bench, slot_layout):
             path = self.portrait_paths[champion_id]
@@ -281,6 +296,7 @@ class App:
                 width=slot_size,
                 height=slot_size,
             )
+            self.cards[champion_id] = card
             card.pack_propagate(False)
             button = tk.Button(
                 card,
@@ -295,6 +311,12 @@ class App:
                 takefocus=True,
             )
             button.pack(fill="both", expand=True)
+            button.bind("<Enter>", lambda _event, value=champion_id: self._hover(value, True))
+            button.bind("<Leave>", lambda _event, value=champion_id: self._hover(value, False))
+            if champion_id == target:
+                badge = tk.Label(card, text="✓", bg=GOLD, fg=BG, font=("Segoe UI", 9, "bold"))
+                badge.place(relx=1, x=-2, y=2, anchor="ne")
+                badge.bind("<Button-1>", lambda _event, value=champion_id: self._choose(value))
 
         self._show_bar()
 
@@ -308,6 +330,42 @@ class App:
             self.session_state["target"] = target
             self.last_render_signature = None
             self._render_session()
+            if target is None and hasattr(self, "feedback"):
+                self.feedback.configure(text="已取消目标 · 点击头像重新选择")
+            self._animate_click(champion_id)
+
+    def _selection_text(self, target: int | None) -> str:
+        if target is None:
+            return "点击头像设为目标"
+        summary = self.summaries.get(target)
+        name = summary.name if summary else f"英雄 {target}"
+        if self.session_state and self.session_state.get("current") == target:
+            return f"✓ 已换到 {name}"
+        return f"✓ 已选 {name}\n再次点击取消"
+
+    def _hover(self, champion_id: int, entered: bool) -> None:
+        card = self.cards.get(champion_id)
+        if card is not None and champion_id not in self.animation_jobs:
+            target = self.session_state.get("target") if self.session_state else None
+            card.configure(bg=GOLD if target == champion_id else ("#6b91ab" if entered else IDLE_BORDER))
+
+    def _animate_click(self, champion_id: int, frame: int = 0) -> None:
+        card = self.cards.get(champion_id)
+        if card is None or not self.animations_enabled:
+            return
+        colors = ("#fff2be", "#ffe19a", "#efd080", "#dbb45c")
+        if frame < len(colors):
+            card.configure(bg=colors[frame])
+            self.animation_jobs[champion_id] = self.root.after(
+                55, lambda: self._animate_click(champion_id, frame + 1))
+        else:
+            self.animation_jobs.pop(champion_id, None)
+            self._hover(champion_id, False)
+
+    def _sync_focus(self) -> None:
+        if self.bar_visible and self.client_hwnd is not None:
+            sync_bar_z_order(self.root.winfo_id(), self.client_hwnd)
+        self.root.after(100, self._sync_focus)
 
     def _show_bar(self) -> None:
         if self.bar_visible:
@@ -316,7 +374,8 @@ class App:
         if self.root.state() == "withdrawn":
             self.root.deiconify()
             self.root.after_idle(self._apply_borderless_window_style)
-        self.root.lift()
+        if self.client_hwnd is not None:
+            sync_bar_z_order(self.root.winfo_id(), self.client_hwnd)
 
     def _hide_bar(self) -> None:
         if not self.bar_visible and self.root.state() == "withdrawn":
@@ -350,6 +409,7 @@ class App:
                     self.last_render_signature = None
                     self._render_session()
                 elif level == "champ_select" and isinstance(payload, dict):
+                    payload = dict(payload, target=self.engine.target_champion())
                     new_bench = list(payload.get("bench", []))
                     if not new_bench and self._bench():
                         now = time.monotonic()

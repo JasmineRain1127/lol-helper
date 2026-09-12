@@ -4,11 +4,19 @@ import ctypes
 from ctypes import wintypes
 
 
-user32 = ctypes.windll.user32
-user32.GetAncestor.argtypes = (wintypes.HWND, wintypes.UINT)
-user32.GetAncestor.restype = wintypes.HWND
-user32.GetParent.argtypes = (wintypes.HWND,)
-user32.GetParent.restype = wintypes.HWND
+# Keep geometry helpers importable for tests on non-Windows hosts.
+user32 = ctypes.windll.user32 if hasattr(ctypes, "windll") else None
+if user32 is not None:
+    user32.GetAncestor.argtypes = (wintypes.HWND, wintypes.UINT)
+    user32.GetAncestor.restype = wintypes.HWND
+    user32.GetParent.argtypes = (wintypes.HWND,)
+    user32.GetParent.restype = wintypes.HWND
+    user32.GetForegroundWindow.restype = wintypes.HWND
+    user32.GetWindow.argtypes = (wintypes.HWND, wintypes.UINT)
+    user32.GetWindow.restype = wintypes.HWND
+    user32.SetWindowPos.argtypes = (wintypes.HWND, wintypes.HWND, ctypes.c_int,
+                                   ctypes.c_int, ctypes.c_int, ctypes.c_int, wintypes.UINT)
+    user32.SetWindowPos.restype = wintypes.BOOL
 
 GWL_EXSTYLE = -20
 WS_EX_TOOLWINDOW = 0x00000080
@@ -32,7 +40,7 @@ def show_in_taskbar(tk_window_id: int) -> None:
     """Expose a borderless Tk window as a normal Windows taskbar app."""
     hwnd = native_window_handle(tk_window_id)
     style = user32.GetWindowLongW(hwnd, GWL_EXSTYLE)
-    style = (style & ~WS_EX_TOOLWINDOW) | WS_EX_APPWINDOW
+    style = (style & ~WS_EX_TOOLWINDOW) | WS_EX_APPWINDOW | 0x08000000  # WS_EX_NOACTIVATE
     user32.SetWindowLongW(hwnd, GWL_EXSTYLE, style)
     user32.SetWindowPos(
         hwnd,
@@ -69,8 +77,8 @@ def system_window_animations_enabled() -> bool:
     return bool(enabled.value)
 
 
-def league_client_rect() -> tuple[int, int, int, int] | None:
-    matches: list[tuple[int, int, int, int]] = []
+def league_client_window() -> tuple[int, tuple[int, int, int, int]] | None:
+    matches: list[tuple[int, tuple[int, int, int, int]]] = []
     callback_type = ctypes.WINFUNCTYPE(ctypes.c_bool, wintypes.HWND, wintypes.LPARAM)
 
     def callback(hwnd: int, _lparam: int) -> bool:
@@ -88,11 +96,11 @@ def league_client_rect() -> tuple[int, int, int, int] | None:
         if user32.GetWindowRect(hwnd, ctypes.byref(rect)):
             width, height = rect.right - rect.left, rect.bottom - rect.top
             if width >= 600 and height >= 400:
-                matches.append((rect.left, rect.top, rect.right, rect.bottom))
+                matches.append((hwnd, (rect.left, rect.top, rect.right, rect.bottom)))
         return True
 
     user32.EnumWindows(callback_type(callback), 0)
-    return max(matches, key=lambda value: (value[2] - value[0]) * (value[3] - value[1])) if matches else None
+    return max(matches, key=lambda value: (value[1][2] - value[1][0]) * (value[1][3] - value[1][1])) if matches else None
 
 
 def top_bar_geometry(rect: tuple[int, int, int, int], height: int = 72) -> str:
@@ -101,3 +109,31 @@ def top_bar_geometry(rect: tuple[int, int, int, int], height: int = 72) -> str:
     width = max(1, right - left)
     bar_height = max(1, height)
     return f"{width}x{bar_height}{left:+d}{top - bar_height:+d}"
+
+
+def league_client_rect() -> tuple[int, int, int, int] | None:
+    window = league_client_window()
+    return window[1] if window else None
+
+
+def sync_bar_z_order(tk_window_id: int, client_hwnd: int) -> None:
+    """Place the bar directly above the client without activating either window.
+
+    Use the ordinary Z-order band, never HWND_TOPMOST. In the background,
+    insert after the window immediately above the client so other apps stay above us.
+    """
+    hwnd = native_window_handle(tk_window_id)
+    if not user32.IsWindow(client_hwnd) or user32.IsIconic(client_hwnd):
+        return
+    foreground = user32.GetForegroundWindow()
+    if foreground in (client_hwnd, hwnd):
+        insert_after = 0  # HWND_TOP in the non-topmost band
+    else:
+        insert_after = user32.GetWindow(client_hwnd, 3)  # GW_HWNDPREV
+        if insert_after == hwnd:
+            return
+        # A topmost predecessor would promote us into its band. Stay below it.
+        if insert_after and user32.GetWindowLongW(insert_after, GWL_EXSTYLE) & 0x8:
+            insert_after = -2  # HWND_NOTOPMOST
+    user32.SetWindowPos(hwnd, insert_after, 0, 0, 0, 0,
+                        SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE)

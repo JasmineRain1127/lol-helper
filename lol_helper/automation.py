@@ -138,6 +138,10 @@ class AutomationEngine:
         else:
             self._event("info", "已清除本局选取目标")
 
+    def target_champion(self) -> int | None:
+        """Return the latest selected target, including clicks newer than queued events."""
+        return self._target()
+
     def _target(self) -> int | None:
         with self._target_lock:
             return self._target_champion_id
@@ -210,28 +214,48 @@ class AutomationEngine:
     def _run(self) -> None:
         last_connection_message: str | None = None
         while not self._stop.is_set():
-            if self._client is None and not self._connect():
-                if self._connection_message != last_connection_message:
-                    level = "permission" if "管理员" in self._connection_message else "offline"
-                    self._event(level, self._connection_message)
-                    last_connection_message = self._connection_message
-                self._stop.wait(2.0)
-                continue
-            last_connection_message = None
             try:
+                if self._client is None and not self._connect():
+                    self._clear_session()
+                    if self._connection_message != last_connection_message:
+                        level = "permission" if "管理员" in self._connection_message else "offline"
+                        self._event(level, self._connection_message)
+                        last_connection_message = self._connection_message
+                    self._stop.wait(2.0)
+                    continue
+                last_connection_message = None
                 self._tick()
             except LCUNotRunning:
-                self._client = None
-                self._last_session = None
-                self._catalog_loaded = False
-                self._last_phase = None
-                self._accepted_id = None
-                self._event("offline", "客户端已断开，正在等待重连")
+                self._disconnect()
+            except LCUResponseError as exc:
+                if exc.status in {401, 403}:
+                    self._disconnect()
+                else:
+                    self._logger.exception("LCU 请求失败")
+                    self._event("error", f"LCU 请求失败：{exc}")
             except Exception as exc:  # keep the monitor alive and retain diagnostics
                 self._logger.exception("监控循环异常")
                 self._event("error", f"监控异常：{exc}")
             interval = max(150, min(self._settings_provider().poll_interval_ms, 2000)) / 1000
             self._stop.wait(interval)
+
+    def _disconnect(self) -> None:
+        self._client = None
+        self._catalog_loaded = False
+        self._last_phase = None
+        self._accepted_id = None
+        self._clear_session()
+        self._event("offline", "客户端已断开，正在等待重连")
+
+    def _clear_session(self) -> None:
+        self._last_session = None
+        with self._target_lock:
+            self._picked_session = False
+            self._swap_attempt.clear()
+            had_target = self._target_champion_id is not None
+            self._target_champion_id = None
+        if had_target:
+            self._event("target_cleared", "选角会话已结束，本局目标已清空")
 
     def _tick(self) -> None:
         assert self._client is not None
@@ -247,13 +271,7 @@ class AutomationEngine:
         if phase == "ChampSelect":
             self._champ_select(settings)
         else:
-            self._last_session = None
-            self._picked_session = False
-            self._swap_attempt.clear()
-            if self._target() is not None:
-                with self._target_lock:
-                    self._target_champion_id = None
-                self._event("target_cleared", "已离开选角，本局目标已清空")
+            self._clear_session()
 
     def _accept(self) -> None:
         assert self._client is not None

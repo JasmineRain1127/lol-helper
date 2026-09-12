@@ -1,4 +1,8 @@
+import json
 import logging
+import tempfile
+from types import SimpleNamespace
+from unittest.mock import Mock, patch
 import unittest
 from pathlib import Path
 from uuid import uuid4
@@ -15,9 +19,9 @@ from lol_helper.automation import (
 )
 from lol_helper.config import ROOT, Settings
 from lol_helper.ddragon import ChampionSummary, DataDragon
-from lol_helper.lcu import Credentials, _credentials_from_lockfile, _extract_credentials
-from lol_helper.ui import bench_slot_layout, should_show_bar
-from lol_helper.window_docking import top_bar_geometry
+from lol_helper.lcu import LCUNotRunning, LCUResponseError, Credentials, _credentials_from_lockfile, _extract_credentials
+from lol_helper.ui import App, bench_slot_layout, should_show_bar
+from lol_helper.window_docking import top_bar_geometry, sync_bar_z_order, SWP_NOACTIVATE
 
 
 class CredentialsTests(unittest.TestCase):
@@ -94,6 +98,42 @@ class SessionTests(unittest.TestCase):
 
 
 class SettingsTests(unittest.TestCase):
+    def test_invalid_shapes_fall_back_to_defaults(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "settings.json"
+            for raw in ([], None, 42, "settings", {"poll_interval_ms": "fast"}):
+                with self.subTest(raw=raw):
+                    path.write_text(json.dumps(raw), encoding="utf-8")
+                    self.assertEqual(Settings.load(path), Settings())
+
+    def test_validates_fields_independently(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "settings.json"
+            path.write_text(json.dumps({
+                "auto_accept": False, "auto_pick": "false",
+                "poll_interval_ms": 1,
+                "preferred_champions": [81, 81, True, -1, "22", 22],
+            }), encoding="utf-8")
+            self.assertEqual(Settings.load(path), Settings(False, True, True, [81, 22], 150))
+
+    def test_snapshot_preserves_disabled_automation(self):
+        app = SimpleNamespace(settings=Settings(False, False, False, [81], 500))
+        snapshot = App._settings_snapshot(app)
+        self.assertEqual(snapshot, app.settings)
+        snapshot.preferred_champions.clear()
+        self.assertEqual(app.settings.preferred_champions, [81])
+
+    def test_failed_replace_preserves_existing_config(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "settings.json"
+            Settings(auto_accept=False).save(path)
+            original = path.read_bytes()
+            with patch.object(Path, "replace", side_effect=OSError("disk error")):
+                with self.assertRaises(OSError):
+                    Settings().save(path)
+            self.assertEqual(path.read_bytes(), original)
+            self.assertEqual(list(Path(folder).iterdir()), [path])
+
     def test_roundtrip(self):
         folder = ROOT / ".test-tmp" / uuid4().hex
         path = folder / "settings.json"
@@ -112,6 +152,35 @@ class SettingsTests(unittest.TestCase):
 
 
 class AutomationEngineTests(unittest.TestCase):
+    def test_connection_failure_does_not_kill_monitor(self):
+        for error in (LCUNotRunning("offline"), LCUResponseError(401, "expired")):
+            with self.subTest(error=error):
+                events = []
+                engine = AutomationEngine(Settings, lambda *event: events.append(event), logging.getLogger())
+                engine.set_target_champion(22)
+                engine._picked_session = True
+                engine._swap_attempt[22] = 100
+                engine._last_session = {"benchChampions": [22]}
+                client = Mock()
+                client.get.side_effect = error
+                engine._stop = Mock()
+                engine._stop.is_set.side_effect = [False, False, True]
+                with patch("lol_helper.automation.LCUClient", return_value=client) as factory:
+                    engine._run()
+                self.assertEqual(factory.call_count, 2)
+                self.assertIsNone(engine._target())
+                self.assertIsNone(engine._last_session)
+                self.assertFalse(engine._picked_session)
+                self.assertEqual(engine._swap_attempt, {})
+                self.assertEqual(sum(level == "target_cleared" for level, _ in events), 1)
+
+    def test_disabled_auto_accept_sends_no_action(self):
+        engine = AutomationEngine(lambda: Settings(auto_accept=False), lambda *_: None, logging.getLogger())
+        engine._client = Mock()
+        engine._client.get.return_value = "ReadyCheck"
+        engine._tick()
+        engine._client.post.assert_not_called()
+
     def test_accepts_once_per_ready_check(self):
         class Client:
             phase = "ReadyCheck"
@@ -209,6 +278,39 @@ class AutomationSwapTests(unittest.TestCase):
 
 
 class WindowDockingTests(unittest.TestCase):
+    def test_z_order_follows_client_without_activation(self):
+        for foreground, predecessor, expected in ((10, 30, 0), (20, 30, 0), (30, 40, 40), (30, 20, None)):
+            with self.subTest(foreground=foreground, predecessor=predecessor):
+                native = Mock()
+                native.IsWindow.return_value = True
+                native.IsIconic.return_value = False
+                native.GetForegroundWindow.return_value = foreground
+                native.GetWindow.return_value = predecessor
+                native.GetWindowLongW.return_value = 0
+                with patch("lol_helper.window_docking.user32", native), patch(
+                    "lol_helper.window_docking.native_window_handle", return_value=20
+                ):
+                    sync_bar_z_order(200, 10)
+                if expected is None:
+                    native.SetWindowPos.assert_not_called()
+                else:
+                    args = native.SetWindowPos.call_args.args
+                    self.assertEqual(args[:2], (20, expected))
+                    self.assertTrue(args[-1] & SWP_NOACTIVATE)
+
+    def test_topmost_predecessor_does_not_promote_overlay(self):
+        native = Mock()
+        native.IsWindow.return_value = True
+        native.IsIconic.return_value = False
+        native.GetForegroundWindow.return_value = 30
+        native.GetWindow.return_value = 30
+        native.GetWindowLongW.return_value = 0x8
+        with patch("lol_helper.window_docking.user32", native), patch(
+            "lol_helper.window_docking.native_window_handle", return_value=20
+        ):
+            sync_bar_z_order(200, 10)
+        self.assertEqual(native.SetWindowPos.call_args.args[1], -2)
+
     def test_top_bar_sits_above_client_top_edge(self):
         self.assertEqual(top_bar_geometry((100, 150, 1380, 870)), "1280x72+100+78")
 
@@ -220,6 +322,29 @@ class WindowDockingTests(unittest.TestCase):
 
 
 class TopBarUiTests(unittest.TestCase):
+    def test_click_selects_then_cancels_with_immediate_feedback(self):
+        app = App.__new__(App)
+        app.session_state = {"bench": [22], "target": None}
+        app.engine = Mock()
+        app._render_session = Mock()
+        app._animate_click = Mock()
+        app.feedback = Mock()
+        app._choose(22)
+        self.assertEqual(app.session_state["target"], 22)
+        app.engine.set_target_champion.assert_called_with(22)
+        app._animate_click.assert_called_with(22)
+        app._choose(22)
+        self.assertIsNone(app.session_state["target"])
+        app.feedback.configure.assert_called_with(text="已取消目标 · 点击头像重新选择")
+
+    def test_selection_feedback_distinguishes_target_from_success(self):
+        app = App.__new__(App)
+        app.summaries = {22: ChampionSummary(22, "艾希", "Ashe.png")}
+        app.session_state = {"current": 81}
+        self.assertIn("已选 艾希", app._selection_text(22))
+        app.session_state["current"] = 22
+        self.assertIn("已换到 艾希", app._selection_text(22))
+
     def test_bench_slots_match_1280_client_design_coordinates(self):
         self.assertEqual(
             bench_slot_layout(1280, 3),
